@@ -6,24 +6,22 @@
 require("dotenv").config();
 const { WebcastPushConnection } = require("tiktok-live-connector");
 const admin = require("firebase-admin");
+const path = require("path");
 
 // =============================
-// 🔐 FIREBASE INIT
+// 🔐 FIREBASE INIT (FILE JSON)
 // =============================
 let serviceAccount;
 try {
-  if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-    throw new Error("Thiếu biến FIREBASE_SERVICE_ACCOUNT");
-  }
-  const json = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, "base64").toString("utf8");
-  serviceAccount = JSON.parse(json);
+  const serviceAccountPath = path.join(__dirname, "serviceAccountKey.json");
+  serviceAccount = require(serviceAccountPath);
 } catch (err) {
-  console.error("❌ Lỗi đọc Firebase service account:", err.message);
+  console.error("❌ Không đọc được file serviceAccountKey.json:", err.message);
   process.exit(1);
 }
 
 if (!process.env.FIREBASE_DB_URL) {
-  console.error("❌ Thiếu biến FIREBASE_DB_URL");
+  console.error("❌ Thiếu biến FIREBASE_DB_URL trong file .env");
   process.exit(1);
 }
 
@@ -42,7 +40,7 @@ const RECONNECT_DELAY = 15000;
 const OFFLINE_RETRY_DELAY = 30000;
 
 if (!TIKTOK_USERNAME) {
-  console.error("❌ Thiếu biến TIKTOK_USERNAME");
+  console.error("❌ Thiếu biến TIKTOK_USERNAME trong file .env");
   process.exit(1);
 }
 
