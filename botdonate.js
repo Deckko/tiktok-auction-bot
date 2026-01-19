@@ -1,24 +1,29 @@
+// =============================
+// TikTok Auction Bot - VIP Stable Version
+// Author: Deckko
+// =============================
+
 require("dotenv").config();
-const admin = require("firebase-admin");
 const { WebcastPushConnection } = require("tiktok-live-connector");
+const admin = require("firebase-admin");
 
-// ================== FIREBASE SETUP ==================
+// =============================
+// 🔐 FIREBASE INIT
+// =============================
 let serviceAccount;
-
-if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-  console.error("❌ Không tìm thấy biến FIREBASE_SERVICE_ACCOUNT trong môi trường.");
-  process.exit(1);
-}
-
 try {
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+    throw new Error("Thiếu biến FIREBASE_SERVICE_ACCOUNT");
+  }
+  const json = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, "base64").toString("utf8");
+  serviceAccount = JSON.parse(json);
 } catch (err) {
-  console.error("❌ FIREBASE_SERVICE_ACCOUNT không phải JSON hợp lệ:", err);
+  console.error("❌ Lỗi đọc Firebase service account:", err.message);
   process.exit(1);
 }
 
 if (!process.env.FIREBASE_DB_URL) {
-  console.error("❌ Không tìm thấy biến FIREBASE_DB_URL.");
+  console.error("❌ Thiếu biến FIREBASE_DB_URL");
   process.exit(1);
 }
 
@@ -29,64 +34,172 @@ admin.initializeApp({
 
 const db = admin.database();
 
-// ================== TIKTOK SETUP ==================
-const tiktokUsername = process.env.TIKTOK_USERNAME;
+// =============================
+// ⚙️ CONFIG
+// =============================
+const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME;
+const RECONNECT_DELAY = 15000;
+const OFFLINE_RETRY_DELAY = 30000;
 
-if (!tiktokUsername) {
-  console.error("❌ Không tìm thấy biến TIKTOK_USERNAME.");
+if (!TIKTOK_USERNAME) {
+  console.error("❌ Thiếu biến TIKTOK_USERNAME");
   process.exit(1);
 }
 
-const tiktokConnection = new WebcastPushConnection(tiktokUsername);
+let connection = null;
+let isConnecting = false;
 
-// ================== MAIN LOGIC ==================
-console.log("🚀 Bot đang khởi động...");
+// =============================
+// 🧠 HELPER FUNCTIONS
+// =============================
+async function logEvent(type, data) {
+  try {
+    const ref = db.ref("logs").push();
+    await ref.set({
+      type,
+      data,
+      time: Date.now(),
+    });
+  } catch (err) {
+    console.error("⚠️ Lỗi ghi log Firebase:", err.message);
+  }
+}
 
-tiktokConnection.connect()
-  .then(state => {
-    console.log(`✅ Đã kết nối TikTok: ${state.roomId}`);
-  })
-  .catch(err => {
-    console.error("❌ Không kết nối được TikTok:", err);
-    process.exit(1);
+async function saveGift(data) {
+  try {
+    const ref = db.ref("gifts").push();
+    await ref.set({
+      user: data.uniqueId || "unknown",
+      giftId: data.giftId || null,
+      giftName: data.giftName || "unknown",
+      repeatCount: data.repeatCount || 1,
+      diamondCount: data.diamondCount || 0,
+      totalDiamond: (data.diamondCount || 0) * (data.repeatCount || 1),
+      time: Date.now(),
+    });
+  } catch (err) {
+    console.error("⚠️ Lỗi lưu gift Firebase:", err.message);
+  }
+}
+
+async function updateAuction(data) {
+  try {
+    const auctionRef = db.ref("auction/current");
+
+    const snapshot = await auctionRef.once("value");
+    const auction = snapshot.val() || {
+      highestBid: 0,
+      highestBidder: null,
+      lastGift: null,
+    };
+
+    const giftValue = (data.diamondCount || 0) * (data.repeatCount || 1);
+
+    if (giftValue > auction.highestBid) {
+      const newAuction = {
+        highestBid: giftValue,
+        highestBidder: data.uniqueId || "unknown",
+        lastGift: data.giftName || "unknown",
+        updatedAt: Date.now(),
+      };
+      await auctionRef.set(newAuction);
+      console.log("🏆 CÓ GIÁ ĐẤU MỚI:", newAuction);
+      await logEvent("NEW_HIGHEST_BID", newAuction);
+    }
+  } catch (err) {
+    console.error("⚠️ Lỗi cập nhật đấu giá:", err.message);
+  }
+}
+
+// =============================
+// 🚀 BOT CORE
+// =============================
+async function startBot() {
+  if (isConnecting) return;
+  isConnecting = true;
+
+  console.log("🚀 Bot đang khởi động...");
+  await logEvent("BOT_STARTING", { user: TIKTOK_USERNAME });
+
+  connection = new WebcastPushConnection(TIKTOK_USERNAME, {
+    enableExtendedGiftInfo: true,
+    requestPollingIntervalMs: 2000,
   });
 
-// Khi có donate (gift)
-tiktokConnection.on("gift", async data => {
   try {
-    const username = data.uniqueId;
-    const giftName = data.giftName;
-    const giftCount = data.repeatCount;
-    const giftValue = data.diamondCount * giftCount;
-
-    console.log(`🎁 ${username} gửi ${giftCount} ${giftName} (${giftValue} xu)`);
-
-    const ref = db.ref("donations").push();
-    await ref.set({
-      username,
-      giftName,
-      giftCount,
-      giftValue,
-      timestamp: Date.now()
-    });
-
-    console.log("✅ Đã lưu vào Firebase.");
+    const state = await connection.connect();
+    console.log(`✅ Đã kết nối TikTok: roomId=${state.roomId}`);
+    await logEvent("CONNECTED", state);
+    isConnecting = false;
   } catch (err) {
-    console.error("❌ Lỗi khi lưu donation:", err);
+    console.error("❌ Không kết nối được TikTok:", err.message);
+    await logEvent("CONNECT_FAILED", { error: err.message });
+
+    console.log(`⏳ Thử lại sau ${OFFLINE_RETRY_DELAY / 1000}s...`);
+    isConnecting = false;
+    setTimeout(startBot, OFFLINE_RETRY_DELAY);
+    return;
   }
+
+  // =============================
+  // 🎁 EVENT: GIFT
+  // =============================
+  connection.on("gift", async (data) => {
+    console.log(
+      `🎁 ${data.uniqueId} gửi ${data.giftName} x${data.repeatCount} (${data.diamondCount}💎)`
+    );
+
+    await saveGift(data);
+    await updateAuction(data);
+    await logEvent("GIFT_RECEIVED", data);
+  });
+
+  // =============================
+  // 💬 EVENT: CHAT
+  // =============================
+  connection.on("chat", async (data) => {
+    console.log(`💬 ${data.uniqueId}: ${data.comment}`);
+    await logEvent("CHAT", data);
+  });
+
+  // =============================
+  // 👥 EVENT: MEMBER JOIN
+  // =============================
+  connection.on("member", async (data) => {
+    console.log(`👋 ${data.uniqueId} đã vào phòng`);
+    await logEvent("MEMBER_JOIN", data);
+  });
+
+  // =============================
+  // ⚠️ EVENT: DISCONNECTED
+  // =============================
+  connection.on("disconnected", async () => {
+    console.log("⚠️ Mất kết nối TikTok. Đang reconnect...");
+    await logEvent("DISCONNECTED", {});
+    setTimeout(startBot, RECONNECT_DELAY);
+  });
+
+  // =============================
+  // ❌ EVENT: ERROR
+  // =============================
+  connection.on("error", async (err) => {
+    console.error("❌ Lỗi TikTok:", err.message);
+    await logEvent("ERROR", { error: err.message });
+  });
+}
+
+// =============================
+// 🧯 GLOBAL ERROR HANDLER
+// =============================
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ Unhandled Rejection:", reason);
 });
 
-// Khi có comment
-tiktokConnection.on("chat", data => {
-  console.log(`💬 ${data.uniqueId}: ${data.comment}`);
+process.on("uncaughtException", (err) => {
+  console.error("❌ Uncaught Exception:", err);
 });
 
-// Khi có follow
-tiktokConnection.on("follow", data => {
-  console.log(`➕ ${data.uniqueId} đã follow!`);
-});
-
-// Giữ bot sống 24/7 (Railway cần process không thoát)
-setInterval(() => {
-  console.log("🟢 Bot vẫn đang chạy...");
-}, 60 * 1000);
+// =============================
+// ▶️ START BOT
+// =============================
+startBot();
